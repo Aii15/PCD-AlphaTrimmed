@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -22,20 +23,33 @@ class App(tk.Tk):
         self.reference: np.ndarray | None = None
         self.preview = ttk.Label(self)
         self.preview.pack(fill="both", expand=True, padx=10, pady=10)
+
         controls = ttk.Frame(self)
         controls.pack(fill="x", padx=10, pady=5)
         ttk.Button(controls, text="Buka", command=self.open_image).pack(side="left")
+        ttk.Button(controls, text="Reset", command=self.reset_image).pack(side="left", padx=5)
         ttk.Button(controls, text="Tambahkan Noise", command=self.noise).pack(side="left", padx=5)
         ttk.Button(controls, text="Restorasi", command=self.restore).pack(side="left")
         ttk.Button(controls, text="Simpan", command=self.save_image).pack(side="left", padx=5)
+
+        ttk.Label(controls, text="Noise:").pack(side="left", padx=(10, 2))
         self.model = tk.StringVar(value="salt_pepper")
         ttk.Combobox(
             controls, textvariable=self.model, state="readonly",
             values=("gaussian", "salt_pepper", "speckle", "poisson", "mixed"), width=12
-        ).pack(side="left", padx=8)
-        ttk.Label(controls, text="Window").pack(side="left")
+        ).pack(side="left", padx=4)
+
+        ttk.Label(controls, text="Window:").pack(side="left", padx=(8, 2))
         self.window = tk.IntVar(value=5)
         ttk.Spinbox(controls, from_=3, to=15, increment=2, textvariable=self.window, width=4).pack(side="left")
+
+        ttk.Label(controls, text="Mode:").pack(side="left", padx=(8, 2))
+        self.mode = tk.StringVar(value="spread")
+        ttk.Combobox(
+            controls, textvariable=self.mode, state="readonly",
+            values=("spread", "paper"), width=8
+        ).pack(side="left", padx=4)
+
         self.status = tk.StringVar(value="Buka gambar untuk mulai.")
         ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", padx=10, pady=5)
 
@@ -47,7 +61,15 @@ class App(tk.Tk):
         self.current = self.original.copy()
         self.reference = self.original.copy()
         self.show_image()
-        self.status.set(f"Memuat {Path(filename).name}")
+        h, w, _ = self.original.shape
+        self.status.set(f"Memuat {Path(filename).name} ({w}x{h} px)")
+
+    def reset_image(self) -> None:
+        if self.original is None:
+            return
+        self.current = self.original.copy()
+        self.show_image()
+        self.status.set("Gambar dikembalikan ke kondisi awal.")
 
     def noise(self) -> None:
         if self.original is None:
@@ -55,20 +77,31 @@ class App(tk.Tk):
             return
         self.current = add_noise(self.original, self.model.get(), amount=0.10, sigma=0.08, seed=None)
         self.show_image()
-        self.status.set(f"Noise {self.model.get()} ditambahkan")
+        noisy_psnr = psnr(self.reference, self.current) if self.reference is not None else 0.0
+        self.status.set(f"Noise '{self.model.get()}' ditambahkan | PSNR sebelum restorasi: {noisy_psnr:.2f} dB")
 
     def restore(self) -> None:
         if self.current is None:
             messagebox.showwarning("Belum ada gambar", "Buka gambar terlebih dahulu.")
             return
+        self.status.set("Memproses restorasi...")
+        self.update_idletasks()
         try:
-            self.current = adaptive_alpha_trimmed(self.current, int(self.window.get()))
+            start = time.perf_counter()
+            self.current = adaptive_alpha_trimmed(
+                self.current,
+                window_size=int(self.window.get()),
+                mode=self.mode.get(),
+            )
+            elapsed = time.perf_counter() - start
         except ValueError as error:
             messagebox.showerror("Parameter tidak valid", str(error))
             return
         self.show_image()
         score = psnr(self.reference, self.current) if self.reference is not None else 0.0
-        self.status.set(f"Restorasi selesai | PSNR terhadap gambar awal: {score:.2f} dB")
+        self.status.set(
+            f"Restorasi selesai ({elapsed:.3f} detik) | Mode: {self.mode.get()} | PSNR: {score:.2f} dB"
+        )
 
     def save_image(self) -> None:
         if self.current is None:

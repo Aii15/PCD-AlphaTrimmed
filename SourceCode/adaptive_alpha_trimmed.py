@@ -1,20 +1,17 @@
-"""Adaptive alpha-trimmed mean restoration for grayscale and RGB images.
+"""Optimized Adaptive Alpha-Trimmed Mean restoration for grayscale and RGB images.
 
-The adaptive rule follows Oten and de Figueiredo (IEEE TIP, 2004):
-for every local window, begin with the most aggressively trimmed central
-sample set and decrease the trim until the retained samples are sufficiently
-locally symmetric.  The implementation is channel-independent for RGB data.
+Vectorized implementation based on Oten and de Figueiredo (IEEE TIP, 2004).
 """
 
 from __future__ import annotations
 
 from typing import Literal
-
 import numpy as np
-
+from numpy.lib.stride_tricks import sliding_window_view
 
 ArrayImage = np.ndarray
 NoiseModel = Literal["gaussian", "salt_pepper", "speckle", "poisson", "mixed"]
+CriterionMode = Literal["spread", "paper"]
 
 
 def _validate_image(image: ArrayImage) -> ArrayImage:
@@ -33,12 +30,7 @@ def add_noise(
     sigma: float = 0.08,
     seed: int | None = None,
 ) -> ArrayImage:
-    """Return a clipped noisy copy of an image represented in [0, 1] or [0, 255].
-
-    ``amount`` is the impulse density for salt-and-pepper noise and the
-    proportion of the two components for mixed noise. ``sigma`` is the
-    standard deviation of Gaussian/speckle noise in normalized [0, 1] units.
-    """
+    """Return a clipped noisy copy of an image represented in [0, 1] or [0, 255]."""
     source = _validate_image(image).astype(np.float32)
     scale = 255.0 if source.max(initial=0) > 1.0 else 1.0
     normalized = np.clip(source / scale, 0.0, 1.0)
@@ -46,23 +38,22 @@ def add_noise(
     model = model.lower()
 
     if model == "gaussian":
-        noisy = normalized + rng.normal(0.0, sigma, normalized.shape)
+        noisy = normalized + rng.normal(0.0, sigma, normalized.shape).astype(np.float32)
     elif model == "salt_pepper":
         noisy = normalized.copy()
         mask = rng.random(normalized.shape[:2]) < amount
         salt = rng.random(normalized.shape[:2]) >= 0.5
-        noisy[mask] = salt[mask, None] if noisy.ndim == 3 else salt[mask]
         if noisy.ndim == 3:
             noisy[mask] = np.where(salt[mask, None], 1.0, 0.0)
         else:
             noisy[mask] = np.where(salt[mask], 1.0, 0.0)
     elif model == "speckle":
-        noisy = normalized + normalized * rng.normal(0.0, sigma, normalized.shape)
+        noisy = normalized + normalized * rng.normal(0.0, sigma, normalized.shape).astype(np.float32)
     elif model == "poisson":
         levels = 30.0
-        noisy = rng.poisson(np.clip(normalized, 0.0, 1.0) * levels) / levels
+        noisy = rng.poisson(np.clip(normalized, 0.0, 1.0) * levels).astype(np.float32) / levels
     elif model == "mixed":
-        noisy = normalized + rng.normal(0.0, sigma, normalized.shape)
+        noisy = normalized + rng.normal(0.0, sigma, normalized.shape).astype(np.float32)
         mask = rng.random(normalized.shape[:2]) < amount
         salt = rng.random(normalized.shape[:2]) >= 0.5
         if noisy.ndim == 3:
@@ -77,23 +68,29 @@ def add_noise(
 
 
 def _adaptive_value(values: np.ndarray, threshold: float, max_alpha: float) -> float:
+    """Fast single-window fallback using Eq. (24)-(25) cumulative sums."""
     ordered = np.sort(values.astype(np.float32, copy=False))
     count = ordered.size
-    median = float(np.median(ordered))
-    max_trim = min(int(np.floor(max_alpha * count / 2.0)), (count - 1) // 2)
+    mid = count // 2
+    median = float(ordered[mid])
 
-    # Equation (23)'s symmetry condition is evaluated on each central
-    # interval.  The scale keeps the test meaningful for flat windows.
-    for trim in range(max_trim, -1, -1):
-        central = ordered[trim:count - trim]
-        left = central[: central.size // 2]
-        right = central[-left.size:] if left.size else central
-        if left.size:
-            asymmetry = abs(float(np.mean(left) + np.mean(right) - 2.0 * median))
-            spread = float(np.max(central) - np.min(central))
-            scale = max(spread, np.finfo(np.float32).eps)
-            if asymmetry <= threshold * scale:
-                return float(np.mean(central))
+    left = ordered[mid - 1 :: -1]
+    right = ordered[mid + 1 :]
+    pair_sums = np.cumsum(left + right)
+    idx = np.arange(1, mid + 1, dtype=np.float32)
+
+    av_rest = (median + pair_sums) / (2.0 * idx + 1.0)
+    asymmetry = np.abs(pair_sums / idx - 2.0 * median)
+    spread = np.maximum(right - left, np.finfo(np.float32).eps)
+
+    min_trim = max(mid - int(np.floor(max_alpha * count / 2.0)), 0)
+    valid = asymmetry >= 0.0
+    valid[:min_trim] = False
+    valid &= asymmetry <= threshold * spread
+
+    if np.any(valid):
+        best_i = int(np.nonzero(valid)[0][-1])
+        return float(av_rest[best_i])
     return median
 
 
@@ -102,12 +99,26 @@ def adaptive_alpha_trimmed(
     window_size: int = 5,
     threshold: float = 0.5,
     max_alpha: float = 0.45,
+    mode: CriterionMode = "spread",
+    chunk_rows: int = 128,
 ) -> ArrayImage:
-    """Restore an image using the paper's locally adaptive alpha-trimmed mean.
+    """Vectorized locally adaptive alpha-trimmed mean filter.
 
-    ``window_size`` must be odd. ``threshold`` controls tolerance for local
-    asymmetry; the paper uses 0.5 in its image experiments. ``max_alpha`` is
-    capped below 0.5 so at least one central sample remains.
+    Parameters
+    ----------
+    image : np.ndarray
+        Input 2D grayscale or 3D RGB/RGBA image.
+    window_size : int
+        Odd window size >= 3 (default 5).
+    threshold : float
+        Symmetry tolerance T (default 0.5).
+    max_alpha : float
+        Maximum trimming fraction in [0, 0.5).
+    mode : {"spread", "paper"}
+        - "spread": vectorized version of the normalized spread symmetry test.
+        - "paper": exact recurrence from Section IV-B (Eq. 23-25) of Oten (2004).
+    chunk_rows : int
+        Number of image rows processed per batch to keep RAM usage low.
     """
     source = _validate_image(image)
     if window_size < 3 or window_size % 2 == 0:
@@ -119,17 +130,75 @@ def adaptive_alpha_trimmed(
     scale = 255.0 if source.max(initial=0) > 1.0 else 1.0
     data = np.clip(source.astype(np.float32) / scale, 0.0, 1.0)
     channels = data[..., None] if data.ndim == 2 else data[..., :3]
+
+    height, width, num_channels = channels.shape
     radius = window_size // 2
+    n = window_size * window_size
+    mid = n // 2  # N in paper (n = 2N + 1)
+
     padded = np.pad(channels, ((radius, radius), (radius, radius), (0, 0)), mode="edge")
     output = np.empty_like(channels)
 
-    for row in range(data.shape[0]):
-        for column in range(data.shape[1]):
-            window = padded[row:row + window_size, column:column + window_size]
-            for channel in range(channels.shape[2]):
-                output[row, column, channel] = _adaptive_value(
-                    window[..., channel].reshape(-1), threshold, max_alpha
-                )
+    idx = np.arange(1, mid + 1, dtype=np.float32)
+    counts = 2.0 * idx + 1.0
+    eps = np.finfo(np.float32).eps
+
+    # Process in row chunks so memory stays small even for large images
+    for r_start in range(0, height, chunk_rows):
+        r_end = min(r_start + chunk_rows, height)
+        patch = padded[r_start : r_end + 2 * radius, :, :]
+
+        # Shape: (chunk_H, W, C, window_size, window_size) -> (chunk_H, W, C, n)
+        windows = sliding_window_view(patch, (window_size, window_size), axis=(0, 1))
+        flat_windows = windows.reshape(r_end - r_start, width, num_channels, n)
+
+        # Sort samples inside every window simultaneously in C
+        ordered = np.sort(flat_windows, axis=-1)
+        median = ordered[..., mid]  # S(0) = Av(0)
+
+        # Samples expanding symmetrically outward from median: i = 1 .. N
+        left = ordered[..., mid - 1 :: -1]   # x_{(N+1-i)}
+        right = ordered[..., mid + 1 :]      # x_{(N+1+i)}
+
+        # Eq. (25): S(i) = S(i-1) + x_{(N+1-i)} + x_{(N+1+i)}
+        pair_cumsum = np.cumsum(left + right, axis=-1)
+        av_rest = (median[..., None] + pair_cumsum) / counts  # Av(1) .. Av(N)
+
+        if mode == "paper":
+            # Exact Section IV-B (Eq. 23-25): D(i) = |Av(i) - Av(i-1)| <= T / n
+            av_all = np.concatenate([median[..., None], av_rest], axis=-1)
+            diff = np.abs(av_all[..., 1:] - av_all[..., :-1])
+            min_trim = int(np.ceil((0.5 - max_alpha) * n)) // 2
+            max_i = max(mid - min_trim, 1)
+
+            cond = diff <= (threshold / n)
+            if max_i < mid:
+                cond[..., max_i:] = False
+            # Step 1: while D(i) < T/n and i <= N (continuous from i=1)
+            still_symmetric = np.cumprod(cond, axis=-1).astype(bool)
+            # Pick largest i before symmetry fails; fallback to Av(0)=median
+            valid_count = np.sum(still_symmetric, axis=-1)
+            output[r_start:r_end] = np.take_along_axis(
+                av_all, valid_count[..., None], axis=-1
+            )[..., 0]
+        else:
+            # Vectorized spread criterion (matches original _adaptive_value logic)
+            asymmetry = np.abs(pair_cumsum / idx - 2.0 * median[..., None])
+            spread = np.maximum(right - left, eps)
+            valid = asymmetry <= (threshold * spread)
+
+            max_trim = min(int(np.floor(max_alpha * n / 2.0)), mid)
+            min_i = mid - max_trim  # minimum central expansion index
+            if min_i > 1:
+                valid[..., : min_i - 1] = False
+
+            # Find largest expansion index i (smallest trim) that satisfies symmetry
+            any_valid = np.any(valid, axis=-1)
+            rev_argmax = valid.shape[-1] - 1 - np.argmax(valid[..., ::-1], axis=-1)
+            chosen_av = np.take_along_axis(av_rest, rev_argmax[..., None], axis=-1)[..., 0]
+
+            # Fallback for trim == max_trim (when min_i == 0, i.e., central has 1 sample = median)
+            output[r_start:r_end] = np.where(any_valid, chosen_av, median)
 
     if data.ndim == 2:
         result = output[..., 0]
